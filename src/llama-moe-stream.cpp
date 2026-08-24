@@ -314,8 +314,13 @@ void llama_moe_stream::start_workers_locked() {
 void llama_moe_stream::worker_loop() {
     // page-aligned staging (Metal private buffers require page-aligned source + page-multiple
     // length; O_DIRECT needs the extra head/tail slack for its aligned reads)
+    const int64_t alloc_start = perf_trace ? ggml_time_us() : 0;
     uint8_t * staging = (uint8_t *) moe_aligned_alloc(max_nb_expert + 2*MOE_STREAM_DIRECT_ALIGN);
     GGML_ASSERT(staging != nullptr);
+    if (perf_trace) {
+        LLAMA_LOG_INFO("[PERF_TRACE][expert_host_buffer_alloc] bytes=%zu total=%.3f ms\n",
+                max_nb_expert + 2*MOE_STREAM_DIRECT_ALIGN, (ggml_time_us() - alloc_start)/1000.0);
+    }
 
     std::unique_lock<std::mutex> lk(mtx);
     while (true) {
@@ -340,7 +345,12 @@ void llama_moe_stream::worker_loop() {
 
         bool ok = true;
         for (const auto & wt : sl.weights) {
+            const int64_t read_start = perf_trace ? ggml_time_us() : 0;
             const uint8_t * data = llama_moe_stream_pread(*files[wt.file_idx], staging, wt.nb_expert, wt.offs + (size_t) w.expert*wt.nb_expert, use_direct_io);
+            if (perf_trace) {
+                LLAMA_LOG_INFO("[PERF_TRACE][expert_ssd_read] layer=%d expert=%d tensor=%s bytes=%zu read=%.3f ms\n",
+                        sl.il, w.expert, wt.cache->name, wt.nb_expert, (ggml_time_us() - read_start)/1000.0);
+            }
             if (data == nullptr) {
                 ok = false;
                 break;
@@ -443,6 +453,7 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
 
     auto * sl  = (llama_moe_stream_layer *) userdata;
     auto * mgr = sl->mgr;
+    const int64_t trace_start_us = mgr->perf_trace ? ggml_time_us() : 0;
 
     GGML_ASSERT(a->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_contiguous(a));
@@ -454,6 +465,9 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
           int32_t * out = (int32_t *) dst->data;
 
     std::unique_lock<std::mutex> lk(mgr->mtx);
+    const int64_t hits_before   = mgr->stats.n_hit;
+    const int64_t misses_before = mgr->stats.n_miss;
+    int64_t io_wait_us = 0;
 
     if (mgr->load_failed) {
         GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
@@ -515,7 +529,9 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
             int32_t v;
             while ((v = mgr->pick_victim_locked(*sl, sl->keep.data())) < 0) {
                 // every allowed slot is loading; wait for a commit and retry
+                const int64_t wait_start_us = ggml_time_us();
                 mgr->cv_done.wait(lk);
+                io_wait_us += ggml_time_us() - wait_start_us;
                 if (mgr->load_failed) {
                     GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
                 }
@@ -549,13 +565,27 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
         if (mgr->load_failed) {
             GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
         }
-        mgr->stats.t_stall_us += ggml_time_us() - t0;
+        io_wait_us += ggml_time_us() - t0;
     }
+    mgr->stats.t_stall_us += io_wait_us;
 
     for (int64_t i = 0; i < n; i++) {
         const int32_t s = sl->expert_slot.at(ids[i]);
         sl->slot_last_use[s] = ++sl->use_counter;
         out[i] = s;
+    }
+
+    if (mgr->perf_trace) {
+        const int64_t hits        = mgr->stats.n_hit - hits_before;
+        const int64_t misses      = mgr->stats.n_miss - misses_before;
+        const int64_t total_us    = ggml_time_us() - trace_start_us;
+        const int64_t metadata_us = total_us - io_wait_us;
+        const int32_t layer       = sl->il;
+        const size_t touched      = sl->uniq.size();
+        lk.unlock();
+        LLAMA_LOG_INFO("[PERF_TRACE][moe_cache_wait] layer=%d wave=-1 touched=%zu hits=%" PRId64 " misses=%" PRId64 " "
+                "io_wait=%.3f ms metadata=%.3f ms total=%.3f ms\n",
+                layer, touched, hits, misses, io_wait_us/1000.0, metadata_us/1000.0, total_us/1000.0);
     }
 }
 
@@ -632,6 +662,7 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
 
     // reserve and demand-load this wave's experts (per-expert, same path as the decode remap)
     bool waited = false;
+    int64_t io_wait_us = 0;
     if (count > 0) {
         stats.n_waves_run++;
         for (size_t i = first; i < first + count; i++) {
@@ -654,7 +685,9 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
                 // miss: evict a non-kept slot and queue the load
                 int32_t v;
                 while ((v = pick_victim_locked(sl, sl.keep.data())) < 0) {
+                    const int64_t wait_start_us = ggml_time_us();
                     cv_done.wait(lk);
+                    io_wait_us += ggml_time_us() - wait_start_us;
                     if (load_failed) {
                         GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
                     }
@@ -712,8 +745,9 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
         if (load_failed) {
             GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
         }
-        stats.t_stall_wave_us += ggml_time_us() - t0;
+        io_wait_us += ggml_time_us() - t0;
     }
+    stats.t_stall_wave_us += io_wait_us;
 
     // parking pool: this wave's own resident slots plus the borrowed ones (all keep-protected;
     //   the next same-layer reservation is ordered after this wave's GEMMs by the graph)
@@ -777,6 +811,7 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
     auto * ud  = (llama_moe_stream_wave *) userdata;
     auto * sl  = ud->sl;
     auto * mgr = sl->mgr;
+    const int64_t trace_start_us = mgr->perf_trace ? ggml_time_us() : 0;
 
     const int32_t w = ud->wave;
 
@@ -791,6 +826,9 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
           int32_t * out = (int32_t *) dst->data;
 
     std::unique_lock<std::mutex> lk(mgr->mtx);
+    const int64_t hits_before   = mgr->stats.n_hit;
+    const int64_t misses_before = mgr->stats.n_miss;
+    const int64_t wait_before   = mgr->stats.t_stall_wave_us;
 
     if (mgr->load_failed) {
         GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
@@ -809,6 +847,22 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
     sl->plan_next_wave = w + 1;
 
     mgr->emit_wave_slots(*sl, ids, out, w, n_ids, a->ne[1]);
+
+    if (mgr->perf_trace) {
+        const int64_t hits         = mgr->stats.n_hit - hits_before;
+        const int64_t misses       = mgr->stats.n_miss - misses_before;
+        const int64_t io_wait_us   = mgr->stats.t_stall_wave_us - wait_before;
+        const int64_t total_us     = ggml_time_us() - trace_start_us;
+        const int64_t metadata_us  = total_us - io_wait_us;
+        const size_t first         = (size_t) w*sl->plan_capacity;
+        const size_t touched       = first < sl->uniq.size() ?
+                std::min<size_t>(sl->plan_capacity, sl->uniq.size() - first) : 0;
+        const int32_t layer        = sl->il;
+        lk.unlock();
+        LLAMA_LOG_INFO("[PERF_TRACE][moe_cache_wait] layer=%d wave=%d touched=%zu hits=%" PRId64 " misses=%" PRId64 " "
+                "io_wait=%.3f ms metadata=%.3f ms total=%.3f ms\n",
+                layer, w, touched, hits, misses, io_wait_us/1000.0, metadata_us/1000.0, total_us/1000.0);
+    }
 }
 
 // multi-pass prefill: 1.0 for pairs whose expert belongs to wave w, 0.0 otherwise; multiplied into

@@ -163,6 +163,7 @@ struct llama_moe_stream {
     bool load_failed     = false;
 
     bool debug = false;
+    bool perf_trace = false;
 
     struct {
         int64_t n_calls     = 0; // remap invocations

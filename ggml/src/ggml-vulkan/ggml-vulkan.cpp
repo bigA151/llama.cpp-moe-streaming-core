@@ -49,6 +49,8 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #endif
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
@@ -971,6 +973,11 @@ struct vk_device_struct {
     vk::Fence fence;
     vk_buffer sync_staging;
 
+    std::atomic<bool>     perf_trace_enabled { false };
+    std::atomic<uint64_t> perf_trace_upload_gpu_ns { 0 };
+    std::atomic<uint32_t> perf_trace_timestamp_overflow { 0 };
+    vk::QueryPool         perf_trace_upload_query_pool;
+
     ggml_backend_buffer_type buffer_type;
 
     bool disable_fusion;
@@ -984,6 +991,10 @@ struct vk_device_struct {
         VK_LOG_DEBUG("destroy device " << name);
 
         device.destroyFence(fence);
+
+        if (perf_trace_upload_query_pool) {
+            device.destroyQueryPool(perf_trace_upload_query_pool);
+        }
 
         ggml_vk_destroy_buffer(sync_staging);
 
@@ -2091,6 +2102,21 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+enum vk_perf_trace_stage : uint8_t {
+    VK_PERF_TRACE_ROUTER,
+    VK_PERF_TRACE_ARGSORT,
+    VK_PERF_TRACE_MOE,
+    VK_PERF_TRACE_ATTENTION,
+    VK_PERF_TRACE_STAGE_COUNT,
+    VK_PERF_TRACE_STAGE_NONE = UINT8_MAX,
+};
+
+struct vk_perf_trace_event {
+    vk_perf_trace_stage stage;
+    uint32_t begin;
+    uint32_t end;
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -2160,6 +2186,15 @@ struct ggml_backend_vk_context {
     std::vector<int> query_node_idx;
     int32_t num_queries {};
     int32_t query_idx {};
+
+    bool perf_trace_enabled {};
+    bool perf_trace_active {};
+    vk::QueryPool perf_trace_query_pool;
+    uint32_t perf_trace_query_capacity {};
+    uint32_t perf_trace_query_idx {};
+    std::vector<vk_perf_trace_event> perf_trace_events;
+    std::array<uint64_t, VK_PERF_TRACE_STAGE_COUNT> perf_trace_gpu_ns {};
+    uint32_t perf_trace_timestamp_overflow {};
 };
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
@@ -7848,7 +7883,36 @@ static void ggml_vk_buffer_write_nc_async(ggml_backend_vk_context * ctx, vk_cont
     }
 }
 
-static bool ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, size_t offset, const void * src, size_t spitch, size_t dpitch, size_t width, size_t height, bool sync_staging = false) {
+struct vk_perf_trace_upload_cpu {
+    int64_t staging_memcpy_us {};
+    int64_t cmd_begin_us {};
+    int64_t copy_record_us {};
+    int64_t cmd_end_us {};
+    int64_t queue_submit_us {};
+    int64_t fence_wait_us {};
+    bool gpu_timestamp {};
+};
+
+struct vk_perf_trace_read_cpu {
+    int64_t command_record_us {};
+    int64_t queue_submit_us {};
+    int64_t fence_wait_us {};
+    int64_t memcpy_us {};
+};
+
+static uint32_t ggml_vk_timestamp_valid_bits(const vk_device& device, const vk_queue& queue) {
+    const auto props = device->physical_device.getQueueFamilyProperties();
+    return queue.queue_family_index < props.size() ? props[queue.queue_family_index].timestampValidBits : 0;
+}
+
+static uint64_t ggml_vk_timestamp_delta(uint64_t begin, uint64_t end, uint32_t valid_bits) {
+    if (valid_bits == 0 || valid_bits >= 64) {
+        return end - begin;
+    }
+    return (end - begin) & ((uint64_t(1) << valid_bits) - 1);
+}
+
+static bool ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, size_t offset, const void * src, size_t spitch, size_t dpitch, size_t width, size_t height, bool sync_staging = false, vk_perf_trace_upload_cpu * trace = nullptr) {
     VK_LOG_DEBUG("ggml_vk_buffer_write_2d_async(" << width << ", " << height << ")");
     // Check if src is pinned memory
     vk_buffer buf = nullptr;
@@ -7873,7 +7937,17 @@ static bool ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, siz
         }
 
         ggml_vk_sync_buffers(nullptr, subctx);
+        const int64_t record_start = trace ? ggml_time_us() : 0;
+        if (trace && trace->gpu_timestamp) {
+            subctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eTransfer, dst->device->perf_trace_upload_query_pool, 0);
+        }
         subctx->s->buffer->buf.copyBuffer(buf->buffer, dst->buffer, slices);
+        if (trace && trace->gpu_timestamp) {
+            subctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eTransfer, dst->device->perf_trace_upload_query_pool, 1);
+        }
+        if (trace) {
+            trace->copy_record_us += ggml_time_us() - record_start;
+        }
         return true;
     }
     VK_LOG_DEBUG("STAGING");
@@ -7904,7 +7978,17 @@ static bool ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, siz
     }
 
     ggml_vk_sync_buffers(nullptr, subctx);
+    const int64_t record_start = trace ? ggml_time_us() : 0;
+    if (trace && trace->gpu_timestamp) {
+        subctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eTransfer, dst->device->perf_trace_upload_query_pool, 0);
+    }
     subctx->s->buffer->buf.copyBuffer((VkBuffer)staging_buffer->buffer, (VkBuffer)dst->buffer, slices);
+    if (trace && trace->gpu_timestamp) {
+        subctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eTransfer, dst->device->perf_trace_upload_query_pool, 1);
+    }
+    if (trace) {
+        trace->copy_record_us += ggml_time_us() - record_start;
+    }
 
     if (width == spitch) {
         deferred_memcpy((uint8_t *)staging_buffer->ptr, src, staging_size, &subctx->in_memcpys);
@@ -7921,12 +8005,13 @@ static bool ggml_vk_buffer_write_async(vk_context subctx, vk_buffer& dst, size_t
     return ggml_vk_buffer_write_2d_async(subctx, dst, offset, src, size, size, size, 1, sync_staging);
 }
 
-static void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, size_t spitch, size_t dpitch, size_t width, size_t height) {
+static void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, size_t spitch, size_t dpitch, size_t width, size_t height, vk_perf_trace_upload_cpu * trace = nullptr) {
     VK_LOG_DEBUG("ggml_vk_buffer_write_2d(" << width << ", " << height << ")");
     // Buffer is already mapped
     if(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
         GGML_ASSERT(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
 
+        const int64_t memcpy_start = trace ? ggml_time_us() : 0;
         if (width == spitch && width == dpitch) {
             memcpy((uint8_t *)dst->ptr + offset, src, width * height);
         } else {
@@ -7934,15 +8019,41 @@ static void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * 
                 memcpy((uint8_t *)dst->ptr + offset + i * dpitch, (const uint8_t *) src + i * spitch, width);
             }
         }
+        if (trace) {
+            trace->staging_memcpy_us += ggml_time_us() - memcpy_start;
+        }
     } else {
         std::lock_guard<std::recursive_mutex> guard(dst->device->mutex);
 
+        if (trace) {
+            const uint32_t valid_bits = ggml_vk_timestamp_valid_bits(dst->device, dst->device->transfer_queue);
+            if (valid_bits > 0) {
+                if (!dst->device->perf_trace_upload_query_pool) {
+                    dst->device->perf_trace_upload_query_pool = dst->device->device.createQueryPool(
+                            vk::QueryPoolCreateInfo({}, vk::QueryType::eTimestamp, 2));
+                }
+                dst->device->device.resetQueryPool(dst->device->perf_trace_upload_query_pool, 0, 2);
+                trace->gpu_timestamp = true;
+            } else {
+                dst->device->perf_trace_timestamp_overflow.fetch_add(1);
+            }
+        }
+
+        const int64_t cmd_begin_start = trace ? ggml_time_us() : 0;
         vk_context subctx = ggml_vk_create_temporary_context(dst->device->transfer_queue.cmd_pool);
         ggml_vk_ctx_begin(dst->device, subctx);
-        bool ret = ggml_vk_buffer_write_2d_async(subctx, dst, offset, src, spitch, dpitch, width, height, true);
+        if (trace) {
+            trace->cmd_begin_us += ggml_time_us() - cmd_begin_start;
+        }
+        bool ret = ggml_vk_buffer_write_2d_async(subctx, dst, offset, src, spitch, dpitch, width, height, true, trace);
         GGML_ASSERT(ret);
+        const int64_t cmd_end_start = trace ? ggml_time_us() : 0;
         ggml_vk_ctx_end(subctx);
+        if (trace) {
+            trace->cmd_end_us += ggml_time_us() - cmd_end_start;
+        }
 
+        const int64_t memcpy_start = trace ? ggml_time_us() : 0;
         for (auto& cpy : subctx->in_memcpys) {
             memcpy(cpy.dst, cpy.src, cpy.n);
         }
@@ -7950,17 +8061,40 @@ static void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * 
         for (auto& mset : subctx->memsets) {
             memset(mset.dst, mset.val, mset.n);
         }
+        if (trace) {
+            trace->staging_memcpy_us += ggml_time_us() - memcpy_start;
+        }
 
+        const int64_t submit_start = trace ? ggml_time_us() : 0;
         ggml_vk_submit(subctx, dst->device->fence);
+        if (trace) {
+            trace->queue_submit_us += ggml_time_us() - submit_start;
+        }
+        const int64_t fence_start = trace ? ggml_time_us() : 0;
         VK_CHECK(dst->device->device.waitForFences({ dst->device->fence }, true, UINT64_MAX), "vk_buffer_write_2d waitForFences");
+        if (trace) {
+            trace->fence_wait_us += ggml_time_us() - fence_start;
+        }
         dst->device->device.resetFences({ dst->device->fence });
+
+        if (trace && trace->gpu_timestamp) {
+            uint64_t timestamps[2] {};
+            VK_CHECK(dst->device->device.getQueryPoolResults(
+                    dst->device->perf_trace_upload_query_pool, 0, 2, sizeof(timestamps), timestamps,
+                    sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+                    "perf trace upload timestamps");
+            const uint32_t valid_bits = ggml_vk_timestamp_valid_bits(dst->device, dst->device->transfer_queue);
+            const double ns = ggml_vk_timestamp_delta(timestamps[0], timestamps[1], valid_bits) *
+                    dst->device->properties.limits.timestampPeriod;
+            dst->device->perf_trace_upload_gpu_ns.fetch_add((uint64_t) ns);
+        }
         ggml_vk_queue_command_pools_cleanup(dst->device);
     }
 }
 
-static void ggml_vk_buffer_write(vk_buffer& dst, size_t offset, const void * src, size_t size) {
+static void ggml_vk_buffer_write(vk_buffer& dst, size_t offset, const void * src, size_t size, vk_perf_trace_upload_cpu * trace = nullptr) {
     VK_LOG_DEBUG("ggml_vk_buffer_write(" << size << ")");
-    ggml_vk_buffer_write_2d(dst, offset, src, size, size, size, 1);
+    ggml_vk_buffer_write_2d(dst, offset, src, size, size, size, 1, trace);
 }
 
 static bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height, bool sync_staging = false) {
@@ -8042,7 +8176,7 @@ static bool ggml_vk_buffer_read_async(vk_context subctx, vk_buffer& src, size_t 
     return ggml_vk_buffer_read_2d_async(subctx, src, offset, dst, size, size, size, 1, sync_staging);
 }
 
-static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height) {
+static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height, vk_perf_trace_read_cpu * trace = nullptr) {
     VK_LOG_DEBUG("ggml_vk_buffer_read_2d(" << src->buffer << ", " << offset << ", " << width << ", " << height << ")");
 
     // If the device is not an UMA device the memory is host-accessible through rebar. While writing
@@ -8052,6 +8186,7 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
         GGML_ASSERT(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
 
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
+        const int64_t record_start = trace ? ggml_time_us() : 0;
         vk_context subctx = ggml_vk_create_temporary_context(src->device->compute_queue.cmd_pool);
         ggml_vk_ctx_begin(src->device, subctx);
         subctx->s->buffer->buf.pipelineBarrier(
@@ -8062,12 +8197,24 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
                 vk::AccessFlagBits::eHostRead } },
             {}, {});
         ggml_vk_ctx_end(subctx);
+        if (trace) {
+            trace->command_record_us += ggml_time_us() - record_start;
+        }
+        const int64_t submit_start = trace ? ggml_time_us() : 0;
         ggml_vk_submit(subctx, src->device->fence);
+        if (trace) {
+            trace->queue_submit_us += ggml_time_us() - submit_start;
+        }
+        const int64_t fence_start = trace ? ggml_time_us() : 0;
         VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX),
                  "vk_buffer_read_2d uma waitForFences");
+        if (trace) {
+            trace->fence_wait_us += ggml_time_us() - fence_start;
+        }
         src->device->device.resetFences({ src->device->fence });
         ggml_vk_queue_command_pools_cleanup(src->device);
 
+        const int64_t memcpy_start = trace ? ggml_time_us() : 0;
         if (width == spitch && width == dpitch) {
             memcpy(dst, (const uint8_t *) src->ptr + offset, width * height);
         } else {
@@ -8075,29 +8222,48 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
                 memcpy((uint8_t *) dst + i * dpitch, (const uint8_t *) src->ptr + offset + i * spitch, width);
             }
         }
+        if (trace) {
+            trace->memcpy_us += ggml_time_us() - memcpy_start;
+        }
     } else {
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
 
+        const int64_t record_start = trace ? ggml_time_us() : 0;
         vk_context subctx = ggml_vk_create_temporary_context(src->device->transfer_queue.cmd_pool);
         ggml_vk_ctx_begin(src->device, subctx);
         bool ret = ggml_vk_buffer_read_2d_async(subctx, src, offset, dst, spitch, dpitch, width, height, true);
         GGML_ASSERT(ret);
         ggml_vk_ctx_end(subctx);
+        if (trace) {
+            trace->command_record_us += ggml_time_us() - record_start;
+        }
 
+        const int64_t submit_start = trace ? ggml_time_us() : 0;
         ggml_vk_submit(subctx, src->device->fence);
+        if (trace) {
+            trace->queue_submit_us += ggml_time_us() - submit_start;
+        }
+        const int64_t fence_start = trace ? ggml_time_us() : 0;
         VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX), "vk_buffer_read_2d waitForFences");
+        if (trace) {
+            trace->fence_wait_us += ggml_time_us() - fence_start;
+        }
         src->device->device.resetFences({ src->device->fence });
         ggml_vk_queue_command_pools_cleanup(src->device);
 
+        const int64_t memcpy_start = trace ? ggml_time_us() : 0;
         for (auto& cpy : subctx->out_memcpys) {
             memcpy(cpy.dst, cpy.src, cpy.n);
+        }
+        if (trace) {
+            trace->memcpy_us += ggml_time_us() - memcpy_start;
         }
     }
 }
 
-static void ggml_vk_buffer_read(vk_buffer& src, size_t offset, void * dst, size_t size) {
+static void ggml_vk_buffer_read(vk_buffer& src, size_t offset, void * dst, size_t size, vk_perf_trace_read_cpu * trace = nullptr) {
     VK_LOG_DEBUG("ggml_vk_buffer_read(" << src->buffer << ", " << offset << ", " << size << ")");
-    ggml_vk_buffer_read_2d(src, offset, dst, size, size, size, 1);
+    ggml_vk_buffer_read_2d(src, offset, dst, size, size, size, 1, trace);
 }
 
 static void ggml_vk_buffer_copy_async(vk_context& ctx, vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t size) {
@@ -14486,6 +14652,50 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
 
 static void ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * cgraph, ggml_tensor* tensor, int tensor_idx, bool almost_ready);
 
+static bool ggml_vk_perf_trace_name_has(const ggml_tensor * tensor, const char * needle) {
+    if (!tensor) {
+        return false;
+    }
+    return strstr(tensor->name, needle) != nullptr;
+}
+
+static vk_perf_trace_stage ggml_vk_perf_trace_classify(ggml_cgraph * cgraph, int node_idx, int n_fused) {
+    auto matches = [&](ggml_op op, const char * needle, bool include_sources = false) {
+        for (int i = 0; i <= n_fused; ++i) {
+            const ggml_tensor * node = cgraph->nodes[node_idx + i];
+            if (node->op == op || (needle && ggml_vk_perf_trace_name_has(node, needle))) {
+                return true;
+            }
+            if (needle && include_sources) {
+                for (uint32_t j = 0; j < GGML_MAX_SRC; ++j) {
+                    if (ggml_vk_perf_trace_name_has(node->src[j], needle)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    };
+
+    if (matches(GGML_OP_FLASH_ATTN_EXT, nullptr)) {
+        return VK_PERF_TRACE_ATTENTION;
+    }
+    if (matches(GGML_OP_ARGSORT, "ffn_moe_argsort")) {
+        return VK_PERF_TRACE_ARGSORT;
+    }
+    for (const char * name : { "ffn_moe_logits", "ffn_moe_probs", "ffn_moe_weights", "ffn_moe_topk" }) {
+        if (matches(GGML_OP_COUNT, name)) {
+            return VK_PERF_TRACE_ROUTER;
+        }
+    }
+    for (const char * name : { "ffn_moe_gate", "ffn_moe_up", "ffn_moe_down", "ffn_moe_weighted" }) {
+        if (matches(GGML_OP_COUNT, name, true)) {
+            return VK_PERF_TRACE_MOE;
+        }
+    }
+    return VK_PERF_TRACE_STAGE_NONE;
+}
+
 // Returns true if node has enqueued work into the queue, false otherwise
 // If submit is true the current all operations queued so far are being submitted to Vulkan to overlap cmdlist creation and GPU execution.
 static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
@@ -14622,6 +14832,21 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
                 std::cerr << " rope mode: " << mode;
             }
             std::cerr << std::endl;
+        }
+    }
+
+    const vk_perf_trace_stage trace_stage = ctx->perf_trace_active && ctx->perf_trace_query_pool ?
+            ggml_vk_perf_trace_classify(cgraph, node_idx, ctx->num_additional_fused_ops) : VK_PERF_TRACE_STAGE_NONE;
+    uint32_t trace_begin = 0;
+    bool trace_open = false;
+    if (trace_stage != VK_PERF_TRACE_STAGE_NONE) {
+        if (ctx->perf_trace_query_idx + 2 <= ctx->perf_trace_query_capacity) {
+            trace_begin = ctx->perf_trace_query_idx++;
+            compute_ctx->s->buffer->buf.writeTimestamp(
+                    vk::PipelineStageFlagBits::eAllCommands, ctx->perf_trace_query_pool, trace_begin);
+            trace_open = true;
+        } else {
+            ctx->perf_trace_timestamp_overflow++;
         }
     }
 
@@ -14979,6 +15204,13 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         return false;
     }
 
+    if (trace_open) {
+        const uint32_t trace_end = ctx->perf_trace_query_idx++;
+        compute_ctx->s->buffer->buf.writeTimestamp(
+                vk::PipelineStageFlagBits::eAllCommands, ctx->perf_trace_query_pool, trace_end);
+        ctx->perf_trace_events.push_back({ trace_stage, trace_begin, trace_end });
+    }
+
     ctx->tensor_ctxs[node_idx] = compute_ctx;
 
 #if defined(GGML_VULKAN_CHECK_RESULTS)
@@ -15139,6 +15371,13 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     if (vk_perf_logger_enabled) {
         ctx->perf_logger->print_timings(true);
     }
+    if (ctx->perf_trace_query_pool) {
+        ctx->device->device.destroyQueryPool(ctx->perf_trace_query_pool);
+        ctx->perf_trace_query_pool = nullptr;
+    }
+    if (ctx->perf_trace_enabled) {
+        ctx->device->perf_trace_enabled.store(false);
+    }
 }
 
 static int ggml_vk_get_device_count() {
@@ -15211,7 +15450,22 @@ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
         return;
     }
 
-    ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
+    const bool do_trace = buf->device->perf_trace_enabled.load() && strstr(tensor->name, ".stream_cache") != nullptr;
+    vk_perf_trace_upload_cpu trace;
+    const int64_t total_start = do_trace ? ggml_time_us() : 0;
+    ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size, do_trace ? &trace : nullptr);
+    if (do_trace) {
+        const int64_t total_us = ggml_time_us() - total_start;
+        const int64_t known_us = trace.staging_memcpy_us + trace.cmd_begin_us + trace.copy_record_us +
+                trace.cmd_end_us + trace.queue_submit_us + trace.fence_wait_us;
+        const int64_t metadata_us = std::max<int64_t>(0, total_us - known_us);
+        GGML_LOG_INFO("[PERF_TRACE][expert_upload_enqueue] tensor=%s bytes=%zu "
+                "staging_memcpy=%.3f ms cmd_begin=%.3f ms copy_record=%.3f ms cmd_end=%.3f ms "
+                "queue_submit=%.3f ms fence_wait=%.3f ms metadata=%.3f ms map=0.000 ms unmap=0.000 ms total=%.3f ms\n",
+                tensor->name, size, trace.staging_memcpy_us/1000.0, trace.cmd_begin_us/1000.0,
+                trace.copy_record_us/1000.0, trace.cmd_end_us/1000.0, trace.queue_submit_us/1000.0,
+                trace.fence_wait_us/1000.0, metadata_us/1000.0, total_us/1000.0);
+    }
 }
 
 static void ggml_backend_vk_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset,
@@ -15238,7 +15492,20 @@ static void ggml_backend_vk_buffer_get_tensor(ggml_backend_buffer_t buffer, cons
 
     vk_buffer buf = buf_ctx->dev_buffer;
 
-    ggml_vk_buffer_read(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
+    const bool do_trace = buf->device->perf_trace_enabled.load() &&
+            (strstr(tensor->name, "ffn_moe_argsort_host_copy") != nullptr ||
+             strstr(tensor->name, "ffn_moe_argsort") != nullptr);
+    vk_perf_trace_read_cpu trace;
+    const int64_t total_start = do_trace ? ggml_time_us() : 0;
+    ggml_vk_buffer_read(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size, do_trace ? &trace : nullptr);
+    if (do_trace) {
+        const int64_t total_us = ggml_time_us() - total_start;
+        GGML_LOG_INFO("[PERF_TRACE][expert_argsort_host_copy] tensor=%s bytes=%zu "
+                "command_record=%.3f ms queue_submit=%.3f ms fence_wait=%.3f ms map=0.000 ms "
+                "memcpy=%.3f ms unmap=0.000 ms total=%.3f ms\n",
+                tensor->name, size, trace.command_record_us/1000.0, trace.queue_submit_us/1000.0,
+                trace.fence_wait_us/1000.0, trace.memcpy_us/1000.0, total_us/1000.0);
+    }
 }
 
 static void ggml_backend_vk_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset,
@@ -15689,6 +15956,51 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
         ctx->compute_ctx.reset();
     }
+}
+
+static void ggml_backend_vk_set_perf_trace(ggml_backend_t backend, bool enabled) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    ctx->perf_trace_enabled = enabled;
+    ctx->device->perf_trace_enabled.store(enabled);
+    if (enabled) {
+        GGML_LOG_INFO("[PERF_TRACE] enabled for %s; trace mode synchronizes GPU work at graph boundaries\n",
+                ctx->name.c_str());
+    }
+}
+
+static void ggml_backend_vk_perf_trace_begin(ggml_backend_t backend) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    if (!ctx->perf_trace_enabled) {
+        return;
+    }
+
+    ggml_vk_synchronize(ctx);
+    ctx->perf_trace_gpu_ns.fill(0);
+    ctx->perf_trace_timestamp_overflow = 0;
+    ctx->device->perf_trace_upload_gpu_ns.store(0);
+    ctx->device->perf_trace_timestamp_overflow.store(0);
+    ctx->perf_trace_active = true;
+}
+
+static void ggml_backend_vk_perf_trace_end(ggml_backend_t backend) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    if (!ctx->perf_trace_enabled || !ctx->perf_trace_active) {
+        return;
+    }
+
+    ggml_vk_synchronize(ctx);
+    ctx->perf_trace_active = false;
+
+    const uint64_t upload_ns = ctx->device->perf_trace_upload_gpu_ns.exchange(0);
+    const uint32_t overflow = ctx->perf_trace_timestamp_overflow +
+            ctx->device->perf_trace_timestamp_overflow.exchange(0);
+    GGML_LOG_INFO("[PERF_TRACE][gpu_stages] backend=%s router_compute_gpu_ms=%.3f "
+            "argsort_gpu_ms=%.3f expert_upload_gpu_ms=%.3f moe_compute_gpu_ms=%.3f "
+            "attention_gpu_ms=%.3f timestamp_overflow=%u\n",
+            ctx->name.c_str(), ctx->perf_trace_gpu_ns[VK_PERF_TRACE_ROUTER]/1000000.0,
+            ctx->perf_trace_gpu_ns[VK_PERF_TRACE_ARGSORT]/1000000.0, upload_ns/1000000.0,
+            ctx->perf_trace_gpu_ns[VK_PERF_TRACE_MOE]/1000000.0,
+            ctx->perf_trace_gpu_ns[VK_PERF_TRACE_ATTENTION]/1000000.0, overflow);
 }
 
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
@@ -16258,6 +16570,26 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ggml_vk_submit_transfer_ctx(ctx);
 
     vk_context compute_ctx;
+    if (ctx->perf_trace_active) {
+        const uint32_t valid_bits = ggml_vk_timestamp_valid_bits(ctx->device, ctx->device->compute_queue);
+        const uint32_t required_queries = std::max(2, 2*cgraph->n_nodes + 16);
+        if (valid_bits == 0) {
+            ctx->perf_trace_timestamp_overflow++;
+        } else {
+            if (ctx->perf_trace_query_capacity < required_queries) {
+                if (ctx->perf_trace_query_pool) {
+                    ctx->device->device.destroyQueryPool(ctx->perf_trace_query_pool);
+                }
+                ctx->perf_trace_query_pool = ctx->device->device.createQueryPool(
+                        vk::QueryPoolCreateInfo({}, vk::QueryType::eTimestamp, required_queries));
+                ctx->perf_trace_query_capacity = required_queries;
+            }
+            ctx->device->device.resetQueryPool(
+                    ctx->perf_trace_query_pool, 0, ctx->perf_trace_query_capacity);
+        }
+        ctx->perf_trace_query_idx = 0;
+        ctx->perf_trace_events.clear();
+    }
     if (vk_perf_logger_enabled) {
         // allocate/resize the query pool
         if (ctx->num_queries < cgraph->n_nodes + 1) {
@@ -16618,6 +16950,25 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
         ctx->perf_logger->print_timings();
+    }
+
+    if (ctx->perf_trace_active && ctx->perf_trace_query_idx > 0) {
+        ggml_vk_synchronize(ctx);
+
+        std::vector<uint64_t> timestamps(ctx->perf_trace_query_idx);
+        VK_CHECK(ctx->device->device.getQueryPoolResults(
+                ctx->perf_trace_query_pool, 0, ctx->perf_trace_query_idx,
+                timestamps.size()*sizeof(uint64_t), timestamps.data(), sizeof(uint64_t),
+                vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+                "perf trace graph timestamps");
+
+        const uint32_t valid_bits = ggml_vk_timestamp_valid_bits(ctx->device, ctx->device->compute_queue);
+        for (const auto & event : ctx->perf_trace_events) {
+            const double ns = ggml_vk_timestamp_delta(
+                    timestamps[event.begin], timestamps[event.end], valid_bits) *
+                    ctx->device->properties.limits.timestampPeriod;
+            ctx->perf_trace_gpu_ns[event.stage] += (uint64_t) ns;
+        }
     }
 
     if (!ctx->device->support_async) {
@@ -17917,11 +18268,25 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_set_perf_trace") == 0) {
+        return (void *) ggml_backend_vk_set_perf_trace;
+    }
+    if (strcmp(name, "ggml_backend_perf_trace_begin") == 0) {
+        return (void *) ggml_backend_vk_perf_trace_begin;
+    }
+    if (strcmp(name, "ggml_backend_perf_trace_end") == 0) {
+        return (void *) ggml_backend_vk_perf_trace_end;
+    }
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

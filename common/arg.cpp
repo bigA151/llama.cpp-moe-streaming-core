@@ -760,6 +760,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         ));
     }
 
+    if (params.perf_trace && params.verbosity < LOG_LEVEL_TRACE) {
+        params.verbosity = LOG_LEVEL_TRACE;
+        common_log_set_verbosity_thold(LOG_LEVEL_TRACE);
+    }
+
     return true;
 }
 
@@ -2521,6 +2526,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_stream_direct = true;
         }
     ).set_env("LLAMA_ARG_MOE_STREAM_DIRECT"));
+    add_opt(common_arg(
+        {"--perf-trace"},
+        "trace detailed CPU wall-clock and Vulkan GPU timestamp timings for every ubatch",
+        [](common_params & params) {
+            params.perf_trace = true;
+        }
+    ).set_env("LLAMA_ARG_PERF_TRACE"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

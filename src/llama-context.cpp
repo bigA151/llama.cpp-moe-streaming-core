@@ -19,6 +19,9 @@
 #include <limits>
 #include <stdexcept>
 
+using ggml_backend_perf_trace_set_t  = void (*)(ggml_backend_t backend, bool enabled);
+using ggml_backend_perf_trace_mark_t = void (*)(ggml_backend_t backend);
+
 //
 // llama_context
 //
@@ -70,7 +73,11 @@ llama_context::llama_context(
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
+    cparams.perf_trace              = params.perf_trace;
     cparams.warmup                  = false;
+    if (model.moe_stream()) {
+        model.moe_stream()->perf_trace = params.perf_trace;
+    }
 
     cparams.embeddings_layer_inp.resize(hparams.n_layer(), false);
     embd_layer_inp.resize(hparams.n_layer());
@@ -321,6 +328,17 @@ llama_context::llama_context(
                 auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
                 if (ggml_backend_set_n_threads_fn) {
                     set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
+                }
+            }
+        }
+
+        if (cparams.perf_trace) {
+            for (auto & backend : backends) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+                auto set_perf_trace = (ggml_backend_perf_trace_set_t)
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_perf_trace");
+                if (set_perf_trace) {
+                    set_perf_trace(backend.get(), true);
                 }
             }
         }
@@ -1380,7 +1398,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    if (cparams.perf_trace) {
+        for (auto & backend : backends) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+            auto begin_perf_trace = (ggml_backend_perf_trace_mark_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_perf_trace_begin");
+            if (begin_perf_trace) {
+                begin_perf_trace(backend.get());
+            }
+        }
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    if (cparams.perf_trace) {
+        for (auto & backend : backends) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+            auto end_perf_trace = (ggml_backend_perf_trace_mark_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_perf_trace_end");
+            if (end_perf_trace) {
+                end_perf_trace(backend.get());
+            }
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2472,6 +2512,7 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    ggml_backend_sched_set_perf_trace(sched.get(), cparams.perf_trace);
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -3514,6 +3555,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.perf_trace                  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

@@ -1993,6 +1993,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * ids_gemm = selected_experts;
     if (msl && n_stream_waves == 1) {
         ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view
+        cb(ids_cont, "ffn_moe_argsort_host_copy", il);
         ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
         cb(ids_gemm, "ffn_moe_topk_stream", il);
     }
@@ -2154,6 +2155,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (msl && n_stream_waves > 1) {
         ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts);
+        cb(ids_cont, "ffn_moe_argsort_host_copy", il);
 
         for (uint32_t w = 0; w < n_stream_waves; w++) {
             ggml_tensor * args[2] = { ids_cont, nullptr };
