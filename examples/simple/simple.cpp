@@ -1,13 +1,16 @@
 #include "llama.h"
+#include <cctype>
 #include <clocale>
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m model.gguf [-n n_predict] [-ngl n_gpu_layers] [prompt]\n", argv[0]);
+    printf("\n    %s -m model.gguf [-n n_predict] [-ngl n_gpu_layers] [--moe-stream-cache NG|Ns] [--moe-stream-io-threads N] [prompt]\n", argv[0]);
     printf("\n");
 }
 
@@ -22,6 +25,11 @@ int main(int argc, char ** argv) {
     int ngl = 99;
     // number of tokens to predict
     int n_predict = 32;
+    // MoE expert streaming parameters
+    bool moe_stream = false;
+    uint32_t moe_stream_slots = 0;
+    uint64_t moe_stream_budget = 0;
+    int32_t moe_stream_io_threads = 0;
 
     // parse command line arguments
 
@@ -59,6 +67,51 @@ int main(int argc, char ** argv) {
                     print_usage(argc, argv);
                     return 1;
                 }
+            } else if (strcmp(argv[i], "--moe-stream-cache") == 0) {
+                if (i + 1 < argc) {
+                    try {
+                        const std::string value = argv[++i];
+                        size_t pos = 0;
+                        const uint64_t n = std::stoull(value, &pos);
+                        std::string suffix = value.substr(pos);
+                        for (char & c : suffix) {
+                            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                        }
+
+                        if (suffix == "s" || suffix == "slot" || suffix == "slots") {
+                            if (n > UINT32_MAX) {
+                                throw std::out_of_range("slot count is too large");
+                            }
+                            moe_stream_slots = static_cast<uint32_t>(n);
+                            moe_stream_budget = 0;
+                        } else if (suffix.empty() || suffix == "g" || suffix == "gb" || suffix == "gib") {
+                            moe_stream_budget = n * 1024ull * 1024ull * 1024ull;
+                            moe_stream_slots = 0;
+                        } else {
+                            throw std::invalid_argument("invalid cache suffix");
+                        }
+                        moe_stream = true;
+                    } catch (...) {
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
+            } else if (strcmp(argv[i], "--moe-stream-io-threads") == 0) {
+                if (i + 1 < argc) {
+                    try {
+                        moe_stream_io_threads = static_cast<int32_t>(std::stoi(argv[++i]));
+                        moe_stream = true;
+                    } catch (...) {
+                        print_usage(argc, argv);
+                        return 1;
+                    }
+                } else {
+                    print_usage(argc, argv);
+                    return 1;
+                }
             } else {
                 // prompt starts here
                 break;
@@ -85,6 +138,10 @@ int main(int argc, char ** argv) {
 
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = ngl;
+    model_params.moe_stream = moe_stream;
+    model_params.moe_stream_slots = moe_stream_slots;
+    model_params.moe_stream_budget = moe_stream_budget;
+    model_params.moe_stream_io_threads = moe_stream_io_threads;
 
     llama_model * model = llama_model_load_from_file(model_path.c_str(), model_params);
 
